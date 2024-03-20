@@ -252,6 +252,7 @@ void server_job(mqd_t mqd)
 int main(int argc, char* argv[])
 {
     // test change
+    // test change 2
     if(argc != 3)
         usage(argv[0]);
     int n = atoi(argv[1]);
