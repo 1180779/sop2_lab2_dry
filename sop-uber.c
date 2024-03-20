@@ -1,6 +1,3 @@
-#include <asm-generic/errno-base.h>
-#include <bits/types/__sigval_t.h>
-#include <bits/types/sigevent_t.h>
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
@@ -57,6 +54,20 @@ typedef struct mq_data
     char name[MSG_DRIVER_MAX_NAME];
 } mq_data;
 
+volatile sig_atomic_t end = 0;
+
+void last_signal(int signo) { end = signo; }
+
+int set_handler(void (*f)(int), int sigNo)
+{
+    struct sigaction act;
+    memset(&act, 0, sizeof(struct sigaction));
+    act.sa_handler = f;
+    if (-1 == sigaction(sigNo, &act, NULL))
+        ERR("sigaction");
+    return 0;
+}
+
 void usage(const char* name)
 {
     fprintf(stderr, "USAGE: %s N T\n", name);
@@ -100,13 +111,17 @@ void driver_job(mqd_t mqd, mqd_t mqd_driver)
     mess_pos pos_;
     mess_drive drive;
     drive.pid = getpid();
+    
+    unsigned int prio;
 
     unsigned long mstime;
     struct timespec time;
     while(1) 
     {
-        if(mq_receive(mqd, (char*) &pos_, MSG_SIZE, NULL) < 0)
+        if(mq_receive(mqd, (char*) &pos_, MSG_SIZE, &prio) < 0)
             ERR("mq_receive");
+        if(prio)
+            break;
 
         p = pos_.s;
         printf("[%d] Read task: (%d, %d) -> (%d, %d)\n", getpid(), pos_.s.x, pos_.s.y, pos_.f.x, pos_.f.y);
@@ -142,13 +157,13 @@ mqd_t create_queue()
 
 void server_comp_course(sigval_t data)
 {
-    mqd_t mqd = data.__sival_int;
+    mqd_t mqd = data.sival_int;
     
     struct sigevent sigev;
     memset(&sigev, 0, sizeof(sigev));
     sigev.sigev_notify = SIGEV_THREAD;
     sigev.sigev_notify_function = server_comp_course;
-    sigev.sigev_value.__sival_int = mqd;
+    sigev.sigev_value.sival_int = mqd;
     if(mq_notify(mqd, &sigev) < 0)
         ERR("mq_notify");
    
@@ -194,7 +209,7 @@ void create_drivers(int n, mqd_t mqd, mq_data *data)
                 memset(&sigev, 0, sizeof(sigev));
                 sigev.sigev_notify = SIGEV_THREAD;
                 sigev.sigev_notify_function = server_comp_course;
-                sigev.sigev_value.__sival_int = data[n].mqd;
+                sigev.sigev_value.sival_int = data[n].mqd;
                 if(mq_notify(data[n].mqd, &sigev) < 0)
                     ERR("mq_notify");
                 break;
@@ -208,7 +223,7 @@ void server_job(mqd_t mqd)
 
     unsigned long mstime;
     struct timespec time;
-    while(1)
+    while(!end)
     {
         // printf("Sending message...\n");
         // printf("[Server] Sleeping...\n");
@@ -236,19 +251,31 @@ void server_job(mqd_t mqd)
 
 int main(int argc, char* argv[])
 {
-    if(argc != 2)
+    if(argc != 3)
         usage(argv[0]);
     int n = atoi(argv[1]);
     if(n < 1)
+        usage(argv[0]);
+    int t = atoi(argv[2]);
+    if(t < 1)
         usage(argv[0]);
 
     mq_data *data = malloc(sizeof(mq_data)*n);
     if(!data)
         ERR("malloc");
 
+    set_handler(last_signal, SIGALRM);
+    alarm(t);
+
     mqd_t mqd = create_queue();
     create_drivers(n, mqd, data);
     server_job(mqd);
+
+    // send message to end job
+    mess_drive drive = { .pid = 0, .length = 0 };
+    for(int i = 0; i < n; ++i)
+        if(mq_send(mqd, (char*) &drive, MSG_SIZE_DRIVER, 1) < 0)
+            ERR("mq_send");
 
     while(wait(NULL) > 0);
     for(int i = 0; i < n; ++i)
@@ -258,6 +285,10 @@ int main(int argc, char* argv[])
         if(mq_unlink(data[i].name) < 0)
             ERR("mq_unlink");
     }
+    if(mq_close(mqd) < 0)
+        ERR("mq_close");
+    if(mq_unlink(MQ_NAME) < 0)
+        ERR("mq_unlink");
     free(data);
     return EXIT_SUCCESS;
 }
