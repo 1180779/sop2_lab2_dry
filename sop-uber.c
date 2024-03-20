@@ -1,4 +1,6 @@
 #include <asm-generic/errno-base.h>
+#include <bits/types/__sigval_t.h>
+#include <bits/types/sigevent_t.h>
 #define _GNU_SOURCE
 #define _POSIX_C_SOURCE 200809L
 #include <errno.h>
@@ -10,6 +12,7 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
 
 #define ERR(source) \
     (fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), perror(source), kill(0, SIGKILL), exit(EXIT_FAILURE))
@@ -25,6 +28,11 @@
 #define MSG_SIZE sizeof(mess_pos)
 #define MSG_MAX 10
 
+#define MSG_DRIVER_MAX_NAME 64
+#define MSG_DRIVER_NAME "uber_results_"
+#define MSG_SIZE_DRIVER sizeof(mess_drive)
+#define MSG_MAX_DRIVER 10
+
 typedef struct pos
 {
     int x;
@@ -37,6 +45,18 @@ typedef struct mess_pos
     pos f;
 } mess_pos;
 
+typedef struct mess_drive 
+{
+    unsigned int length;
+    pid_t pid;
+} mess_drive;
+
+typedef struct mq_data
+{
+    mqd_t mqd;
+    char name[MSG_DRIVER_MAX_NAME];
+} mq_data;
+
 void usage(const char* name)
 {
     fprintf(stderr, "USAGE: %s N T\n", name);
@@ -45,37 +65,65 @@ void usage(const char* name)
     exit(EXIT_FAILURE);
 }
 
-void driver_job(mqd_t mqd)
+void driver_change_queue_attr(mqd_t mqd)
+{
+    struct mq_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    if(mq_setattr(mqd, &attr, NULL) < 0)
+        ERR("mq_setattr");
+}
+
+void mq_data_getname(pid_t pid, mq_data *data)
+{
+    snprintf(data->name, MSG_DRIVER_MAX_NAME,"/%s%d", MSG_DRIVER_NAME, pid);
+}
+
+mqd_t driver_open_queue(pid_t pid, int nonblock) 
+{
+    char buf[MSG_DRIVER_MAX_NAME];
+    snprintf(buf, MSG_DRIVER_MAX_NAME,"/%s%d", MSG_DRIVER_NAME, pid);
+
+    struct mq_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.mq_msgsize = MSG_SIZE_DRIVER;
+    attr.mq_maxmsg = MSG_MAX_DRIVER;
+
+    mqd_t mqd;
+    if((mqd = mq_open(buf, O_RDWR | O_CREAT | nonblock, 0666, &attr)) < 0)
+        ERR("mq_open");
+    return mqd; 
+} 
+
+void driver_job(mqd_t mqd, mqd_t mqd_driver)
 {
     pos p;
     mess_pos pos_;
+    mess_drive drive;
+    drive.pid = getpid();
 
     unsigned long mstime;
     struct timespec time;
     while(1) 
     {
         if(mq_receive(mqd, (char*) &pos_, MSG_SIZE, NULL) < 0)
-        {
-            if(errno == EAGAIN)
-            {
-                sleep(1);
-                continue;
-            }
             ERR("mq_receive");
-        }
+
         p = pos_.s;
         printf("[%d] Read task: (%d, %d) -> (%d, %d)\n", getpid(), pos_.s.x, pos_.s.y, pos_.f.x, pos_.f.y);
         
+        drive.length = abs(pos_.f.x - pos_.s.x) + abs(pos_.f.y - pos_.s.y);
         mstime = abs(pos_.s.x - p.x) + abs(pos_.s.y - p.y);
-        mstime += abs(pos_.f.x - pos_.s.x) + abs(pos_.f.y - pos_.s.y);
+        mstime += drive.length; 
         
         time.tv_sec = mstime / 1000000;
         time.tv_nsec = (mstime % 1000000) * 1000000;
         nanosleep(&time, NULL);
+
+        // send results to server
+        if(mq_send(mqd_driver, (char*) &drive, MSG_SIZE_DRIVER, 0) < 0)
+            ERR("mq_send");
+        p = pos_.f;
     }
-    
-    nanosleep(&time, NULL);
-    p = pos_.f;
 }
 
 mqd_t create_queue() 
@@ -92,20 +140,63 @@ mqd_t create_queue()
     return mqd;
 }
 
-void create_drivers(int n, mqd_t mqd)
+void server_comp_course(sigval_t data)
 {
+    mqd_t mqd = data.__sival_int;
+    
+    struct sigevent sigev;
+    memset(&sigev, 0, sizeof(sigev));
+    sigev.sigev_notify = SIGEV_THREAD;
+    sigev.sigev_notify_function = server_comp_course;
+    sigev.sigev_value.__sival_int = mqd;
+    if(mq_notify(mqd, &sigev) < 0)
+        ERR("mq_notify");
+   
+    mess_drive drive;
+    while(1)
+    {
+        if(mq_receive(mqd, (char*) &drive, MSG_SIZE_DRIVER, NULL) < 0)
+        {
+            if(errno != EAGAIN)
+                ERR("mq_receive");
+            break;
+        }
+        printf("The driver [%d] drove a distance of [%d].\n", drive.pid, drive.length);
+    }
+}
+
+void create_drivers(int n, mqd_t mqd, mq_data *data)
+{
+    pid_t pid;
+    mqd_t mqd_driver;
     while(n-- > 0)
     {
-        switch(fork())
+        switch((pid = fork()))
         {
             case 0:
-                driver_job(mqd);
-                mq_close(mqd);
+                free(data);
+                mqd_driver = driver_open_queue(getpid(), 0);
+                driver_change_queue_attr(mqd);
+                driver_job(mqd, mqd_driver);
+                if(mq_close(mqd) < 0)
+                    ERR("mq_close");
+                if(mq_close(mqd_driver) < 0)
+                    ERR("mq_close");
                 exit(EXIT_SUCCESS);
             case -1:
                 ERR("fork");
             default:
-                // parent
+                mq_data_getname(pid, &data[n]);
+                data[n].mqd = driver_open_queue(pid, O_NONBLOCK);
+
+                // set notification
+                struct sigevent sigev;
+                memset(&sigev, 0, sizeof(sigev));
+                sigev.sigev_notify = SIGEV_THREAD;
+                sigev.sigev_notify_function = server_comp_course;
+                sigev.sigev_value.__sival_int = data[n].mqd;
+                if(mq_notify(data[n].mqd, &sigev) < 0)
+                    ERR("mq_notify");
                 break;
         }
     }
@@ -119,8 +210,8 @@ void server_job(mqd_t mqd)
     struct timespec time;
     while(1)
     {
+        // printf("Sending message...\n");
         // printf("[Server] Sleeping...\n");
-
         mstime = rand() % (TIME_MAX - TIME_MIN + 1) + TIME_MIN;
         time.tv_sec = 0;
         time.tv_nsec = mstime * 1000000;
@@ -135,7 +226,7 @@ void server_job(mqd_t mqd)
         {
             if(errno == EAGAIN)
             {
-                fprintf(stderr, "[Server] Queue full. Waiting...\n");
+                fprintf(stderr, "[Server] Queue full. Dropping drive...\n");
                 continue;
             }
             ERR("mq_send");
@@ -151,10 +242,22 @@ int main(int argc, char* argv[])
     if(n < 1)
         usage(argv[0]);
 
+    mq_data *data = malloc(sizeof(mq_data)*n);
+    if(!data)
+        ERR("malloc");
+
     mqd_t mqd = create_queue();
-    create_drivers(n, mqd);
+    create_drivers(n, mqd, data);
     server_job(mqd);
 
     while(wait(NULL) > 0);
+    for(int i = 0; i < n; ++i)
+    {
+        if(mq_close(data[i].mqd) < 0)
+            ERR("mq_close");
+        if(mq_unlink(data[i].name) < 0)
+            ERR("mq_unlink");
+    }
+    free(data);
     return EXIT_SUCCESS;
 }
